@@ -1,9 +1,9 @@
 #include "HMS_EspNow.h"
-
 #include <cstring>
+#include <mutex>
+#include "esp_err.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
-#include "esp_now.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -12,289 +12,403 @@
 namespace {
 constexpr char TAG[] = "HMS_EspNow";
 constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+std::mutex g_instanceMutex;
+HMS_EspNow* g_instance = nullptr;
+std::atomic<uint32_t> g_callbacksInFlight{0};
 }
 
-HMS_EspNow* HMS_EspNow::_instance = nullptr;
+HMS_EspNow::HMS_EspNow(const HMS_EspNowConfig& config) : config_(config) {}
+HMS_EspNow::~HMS_EspNow() { end(); }
 
-HMS_EspNow::HMS_EspNow(const HMS_EspNowConfig& config) : _config(config) {}
-
-HMS_EspNow::~HMS_EspNow() {
-    end();
+HMS_EspNow* HMS_EspNow::instanceSnapshot() {
+    std::lock_guard<std::mutex> lock(g_instanceMutex);
+    HMS_EspNow* instance = g_instance;
+    if (instance) g_callbacksInFlight.fetch_add(1, std::memory_order_acq_rel);
+    return instance;
 }
 
 bool HMS_EspNow::setError(esp_err_t err) {
-    _lastError = err;
-    if (err != ESP_OK) ESP_LOGE(TAG, "%s", esp_err_to_name(err));
+    { std::lock_guard<std::mutex> lock(errorMutex_); lastError_ = err; }
+    if (err != ESP_OK) ESP_LOGE(TAG, "operation failed: %s (0x%x)", esp_err_to_name(err), (unsigned)err);
     return err == ESP_OK;
 }
+esp_err_t HMS_EspNow::lastError() const noexcept {
+    std::lock_guard<std::mutex> lock(errorMutex_);
+    return lastError_;
+}
+bool HMS_EspNow::isInitialized() const noexcept {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return initialized_;
+}
+size_t HMS_EspNow::configuredMaxPayload() const noexcept {
+    return effectiveMaxPayload_.load(std::memory_order_acquire);
+}
+size_t HMS_EspNow::maxPayload() const noexcept { return configuredMaxPayload(); }
+HMS_EspNowCapabilities HMS_EspNow::capabilities() const noexcept {
+    HMS_EspNowCapabilities c{};
+    c.native_version = nativeVersion_.load(std::memory_order_acquire);
+    c.v1_max_payload = HMS_ESPNOW_MAX_PAYLOAD_V1;
+    c.v2_max_payload = HMS_ESPNOW_MAX_PAYLOAD_V2;
+    c.v2_supported = c.native_version >= 2;
+    c.effective_max_payload = effectiveMaxPayload_.load(std::memory_order_acquire);
+    return c;
+}
 
-bool HMS_EspNow::validMac(const uint8_t* mac) const {
+bool HMS_EspNow::validMac(const uint8_t* mac, bool allowBroadcast) const {
     if (!mac) return false;
-    bool allZero = true;
-    for (size_t i = 0; i < 6; ++i) allZero = allZero && (mac[i] == 0);
-    return !allZero;
+    bool allZero = true, allFF = true;
+    for (size_t i = 0; i < 6; ++i) { allZero &= mac[i] == 0; allFF &= mac[i] == 0xFF; }
+    if (allZero) return false;
+    if (allFF) return allowBroadcast && config_.allow_broadcast;
+    return (mac[0] & 0x01U) == 0;
 }
 
 bool HMS_EspNow::prepareWifi() {
-    wifi_mode_t currentMode;
+    wifi_mode_t currentMode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&currentMode);
     if (err == ESP_ERR_WIFI_NOT_INIT) {
-        if (!_config.start_wifi_if_needed) return setError(err);
+        if (config_.wifi_policy != HMS_EspNowWifiPolicy::MANAGE_IF_UNINITIALIZED) return setError(err);
         wifi_init_config_t wifiConfig = WIFI_INIT_CONFIG_DEFAULT();
-        err = esp_wifi_init(&wifiConfig);
-        if (err != ESP_OK) return setError(err);
-        _ownsWifiInit = true;
-
-        err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-        if (err != ESP_OK) return setError(err);
-        err = esp_wifi_set_mode(_config.wifi_mode);
-        if (err != ESP_OK) return setError(err);
-        err = esp_wifi_start();
-        if (err != ESP_OK) return setError(err);
-        _ownsWifiStart = true;
-    } else if (err != ESP_OK) {
-        return setError(err);
-    } else {
-        ESP_LOGI(TAG, "Using existing Wi-Fi subsystem (mode=%d)", (int)currentMode);
-        if (currentMode != WIFI_MODE_STA && currentMode != WIFI_MODE_APSTA) {
-            ESP_LOGE(TAG, "Existing Wi-Fi mode has no station interface; ESP-NOW peer interface is STA");
-            return setError(ESP_ERR_INVALID_STATE);
-        }
+        err = esp_wifi_init(&wifiConfig); if (err != ESP_OK) return setError(err);
+        ownsWifiInit_ = true;
+        err = esp_wifi_set_storage(WIFI_STORAGE_RAM); if (err != ESP_OK) return setError(err);
+        err = esp_wifi_set_mode(config_.wifi_mode); if (err != ESP_OK) return setError(err);
+        err = esp_wifi_start(); if (err != ESP_OK) return setError(err);
+        ownsWifiStart_ = true;
+    } else if (err != ESP_OK) return setError(err);
+    else {
+        const bool hasSta = currentMode == WIFI_MODE_STA || currentMode == WIFI_MODE_APSTA;
+        const bool hasAp = currentMode == WIFI_MODE_AP || currentMode == WIFI_MODE_APSTA;
+        if ((config_.interface == WIFI_IF_STA && !hasSta) || (config_.interface == WIFI_IF_AP && !hasAp)) return setError(ESP_ERR_INVALID_STATE);
     }
 
-    if (_config.channel != 0) {
-        uint8_t primary = 0;
-        wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
-        err = esp_wifi_get_channel(&primary, &second);
-        if (err == ESP_OK && primary == _config.channel) return true;
-
-        // Only change channel when this driver started/owns the Wi-Fi interface.
-        // Existing Wi-Fi owners may be connected to an AP; never disrupt them.
-        if (!_ownsWifiStart) {
-            if (err != ESP_OK) return setError(err);
-            ESP_LOGW(TAG, "Existing Wi-Fi owner controls channel %u; requested channel %u not forced", primary, _config.channel);
-            return true;
-        }
-        err = esp_wifi_set_channel(_config.channel, WIFI_SECOND_CHAN_NONE);
+    if (config_.channel != 0) {
+        uint8_t currentChannel = 0; wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+        err = esp_wifi_get_channel(&currentChannel, &second);
         if (err != ESP_OK) return setError(err);
+        if (currentChannel != config_.channel) {
+            if (ownsWifiStart_) {
+                err = esp_wifi_set_channel(config_.channel, WIFI_SECOND_CHAN_NONE);
+                if (err != ESP_OK) return setError(err);
+            } else if (config_.channel_policy == HMS_EspNowChannelPolicy::REQUIRE_MATCH) {
+                ESP_LOGE(TAG, "Wi-Fi channel mismatch: active=%u requested=%u", currentChannel, config_.channel);
+                return setError(ESP_ERR_INVALID_STATE);
+            } else {
+                ESP_LOGW(TAG, "Using externally managed Wi-Fi channel %u (requested %u)", currentChannel, config_.channel);
+            }
+        }
     }
     return true;
+}
+
+esp_err_t HMS_EspNow::cleanupFailedBegin(esp_err_t cause) {
+    if (sendRegistered_) { (void)esp_now_unregister_send_cb(); sendRegistered_ = false; }
+    if (recvRegistered_) { (void)esp_now_unregister_recv_cb(); recvRegistered_ = false; }
+    {
+        std::lock_guard<std::mutex> lock(g_instanceMutex);
+        if (g_instance == this) g_instance = nullptr;
+    }
+    while (g_callbacksInFlight.load(std::memory_order_acquire) != 0) vTaskDelay(1);
+    if (nowInitialized_) { (void)esp_now_deinit(); nowInitialized_ = false; }
+    if (rxQueue_) { vQueueDelete(rxQueue_); rxQueue_ = nullptr; }
+    if (txQueue_) { vQueueDelete(txQueue_); txQueue_ = nullptr; }
+    if (workerStopped_) { vSemaphoreDelete(workerStopped_); workerStopped_ = nullptr; }
+    releaseOwnedWifi();
+    initialized_ = false;
+    nativeVersion_ = 0;
+    effectiveMaxPayload_ = 0;
+    stopping_ = false;
+    stopRequested_ = false;
+    setError(cause);
+    return cause;
 }
 
 bool HMS_EspNow::begin() {
-    if (_isInitialized) return true;
-    if (_instance && _instance != this) {
-        ESP_LOGE(TAG, "Only one HMS_EspNow instance may be active at a time");
-        return setError(ESP_ERR_INVALID_STATE);
-    }
-    if (_config.event_queue_depth == 0 || _config.worker_stack_size < 2048 ||
-        (_config.wifi_mode != WIFI_MODE_STA && _config.wifi_mode != WIFI_MODE_APSTA)) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    if (initialized_) return setError(ESP_OK);
+    if (stopping_.load()) return setError(ESP_ERR_INVALID_STATE);
+    if (config_.rx_queue_depth == 0 || config_.tx_queue_depth == 0 || config_.worker_stack_size < 3072 ||
+        (config_.wifi_policy != HMS_EspNowWifiPolicy::USE_EXISTING && config_.wifi_policy != HMS_EspNowWifiPolicy::MANAGE_IF_UNINITIALIZED) ||
+        (config_.channel_policy != HMS_EspNowChannelPolicy::REQUIRE_MATCH && config_.channel_policy != HMS_EspNowChannelPolicy::USE_CURRENT) ||
+        (config_.wifi_mode != WIFI_MODE_STA && config_.wifi_mode != WIFI_MODE_AP && config_.wifi_mode != WIFI_MODE_APSTA) ||
+        (config_.interface == WIFI_IF_AP && config_.wifi_mode == WIFI_MODE_STA) ||
+        (config_.interface != WIFI_IF_STA && config_.interface != WIFI_IF_AP) || config_.channel > 14 ||
+        (config_.payload_profile != HMS_EspNowPayloadProfile::V1_COMPAT && config_.payload_profile != HMS_EspNowPayloadProfile::V2) ||
+        (config_.peer_policy != HMS_EspNowPeerPolicy::EXPLICIT_ONLY && config_.peer_policy != HMS_EspNowPeerPolicy::AUTO_ADD_UNENCRYPTED))
         return setError(ESP_ERR_INVALID_ARG);
-    }
-    _stopping = false;
-    _lastError = ESP_OK;
 
-    if (!prepareWifi()) {
-        end();
-        return false;
+    {
+        std::lock_guard<std::mutex> instanceLock(g_instanceMutex);
+        if (g_instance && g_instance != this) return setError(ESP_ERR_INVALID_STATE);
+        g_instance = this;
     }
+    stopping_ = false; stopRequested_ = false;
+    if (!prepareWifi()) return cleanupFailedBegin(lastError());
 
-    QueueHandle_t queue = xQueueCreate(_config.event_queue_depth, sizeof(Event));
-    if (!queue) {
-        setError(ESP_ERR_NO_MEM);
-        end();
-        return false;
-    }
-    _eventQueue = queue;
-    SemaphoreHandle_t stopped = xSemaphoreCreateBinary();
-    if (!stopped) {
-        setError(ESP_ERR_NO_MEM);
-        end();
-        return false;
-    }
-    _workerStopped = stopped;
+    rxQueue_ = xQueueCreate(config_.rx_queue_depth, sizeof(RxEvent));
+    txQueue_ = xQueueCreate(config_.tx_queue_depth, sizeof(TxEvent));
+    workerStopped_ = xSemaphoreCreateBinary();
+    if (!rxQueue_ || !txQueue_ || !workerStopped_) return cleanupFailedBegin(ESP_ERR_NO_MEM);
 
     esp_err_t err = esp_now_init();
-    if (err != ESP_OK) {
-        setError(err);
-        end();
-        return false;
-    }
+    if (err != ESP_OK) return cleanupFailedBegin(err);
+    nowInitialized_ = true;
 
-    _instance = this;
+    uint32_t version = 1;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    err = esp_now_get_version(&version);
+    if (err != ESP_OK) return cleanupFailedBegin(err);
+#endif
+    nativeVersion_.store(version, std::memory_order_release);
+    ESP_LOGI(TAG, "Native ESP-NOW version=%lu; SDK v1 max=%u; SDK v2 max=%u",
+             (unsigned long)version, (unsigned)HMS_ESPNOW_MAX_PAYLOAD_V1, (unsigned)HMS_ESPNOW_MAX_PAYLOAD_V2);
+    const bool nativeV2 = version >= 2;
+    const size_t nativeMax = nativeV2 ? HMS_ESPNOW_MAX_PAYLOAD_V2 : HMS_ESPNOW_MAX_PAYLOAD_V1;
+    if (config_.payload_profile == HMS_EspNowPayloadProfile::V2 && !nativeV2)
+        return cleanupFailedBegin(ESP_ERR_NOT_SUPPORTED);
+    effectiveMaxPayload_.store(config_.payload_profile == HMS_EspNowPayloadProfile::V2 ? nativeMax : HMS_ESPNOW_MAX_PAYLOAD_V1,
+                               std::memory_order_release);
+
     err = esp_now_register_recv_cb(&HMS_EspNow::onDataRecv);
-    if (err != ESP_OK) {
-        setError(err);
-        end();
-        return false;
-    }
-    _recvRegistered = true;
+    if (err != ESP_OK) return cleanupFailedBegin(err);
+    recvRegistered_ = true;
     err = esp_now_register_send_cb(&HMS_EspNow::onDataSent);
-    if (err != ESP_OK) {
-        setError(err);
-        end();
-        return false;
-    }
-    _sendRegistered = true;
+    if (err != ESP_OK) return cleanupFailedBegin(err);
+    sendRegistered_ = true;
 
-    _isInitialized = true;
-    TaskHandle_t workerTask = nullptr;
-    BaseType_t taskResult = xTaskCreate(&HMS_EspNow::workerEntry, "hms_espnow_evt",
-                                        _config.worker_stack_size, this,
-                                        _config.worker_priority, &workerTask);
-    if (taskResult != pdPASS) {
-        setError(ESP_ERR_NO_MEM);
-        _isInitialized = false;
-        end();
-        return false;
-    }
-    _workerTask = workerTask;
-    ESP_LOGI(TAG, "ESP-NOW initialized (max payload=%u bytes)", (unsigned)HMS_ESPNOW_MAX_PAYLOAD);
-    return true;
+    TaskHandle_t task = nullptr;
+    if (xTaskCreate(&HMS_EspNow::workerEntry, "hms_espnow_evt", config_.worker_stack_size, this, config_.worker_priority, &task) != pdPASS)
+        return cleanupFailedBegin(ESP_ERR_NO_MEM);
+    workerTask_.store(task, std::memory_order_release);
+    initialized_ = true;
+    ESP_LOGI(TAG, "Started; native ESP-NOW v%lu; profile=%s; effective max=%u; RXQ=%u TXQ=%u",
+             (unsigned long)version, config_.payload_profile == HMS_EspNowPayloadProfile::V2 ? "v2" : "v1-compatible",
+             (unsigned)maxPayload(), config_.rx_queue_depth, config_.tx_queue_depth);
+    return setError(ESP_OK);
+}
+
+esp_err_t HMS_EspNow::beginDetailed() {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return begin() ? ESP_OK : lastError();
+}
+
+void HMS_EspNow::requestStop() {
+    if (!workerTask_.load(std::memory_order_acquire)) return;
+    stopping_.store(true, std::memory_order_release);
+    stopRequested_.store(true, std::memory_order_release);
 }
 
 void HMS_EspNow::end() {
-    if (!_isInitialized && !_eventQueue && !_workerStopped && !_ownsWifiInit && !_ownsWifiStart && !_recvRegistered && !_sendRegistered) {
-        if (_instance == this) _instance = nullptr;
+    if (workerTask_.load(std::memory_order_acquire) && xTaskGetCurrentTaskHandle() == workerTask_.load(std::memory_order_acquire)) {
+        requestStop();
+        setError(ESP_ERR_INVALID_STATE);
+        ESP_LOGE(TAG, "end() called from event worker; requestStop() recorded. Call end() from an application task.");
         return;
     }
+    std::lock_guard<std::mutex> endLock(endMutex_);
+    std::unique_lock<std::recursive_mutex> lock(apiMutex_);
+    if (!initialized_ && !nowInitialized_ && !ownsWifiInit_ && !ownsWifiStart_) return;
 
-    _stopping = true;
-    if (_recvRegistered) {
-        esp_now_unregister_recv_cb();
-        _recvRegistered = false;
+    stopping_.store(true, std::memory_order_release);
+    if (recvRegistered_) { (void)esp_now_unregister_recv_cb(); recvRegistered_ = false; }
+    if (sendRegistered_) { (void)esp_now_unregister_send_cb(); sendRegistered_ = false; }
+    {
+        std::lock_guard<std::mutex> g(g_instanceMutex);
+        if (g_instance == this) g_instance = nullptr;
     }
-    if (_sendRegistered) {
-        esp_now_unregister_send_cb();
-        _sendRegistered = false;
+    while (g_callbacksInFlight.load(std::memory_order_acquire) != 0) vTaskDelay(1);
+    if (nowInitialized_) {
+        esp_err_t e = esp_now_deinit();
+        if (e != ESP_OK && e != ESP_ERR_ESPNOW_NOT_INIT) ESP_LOGW(TAG, "esp_now_deinit: %s", esp_err_to_name(e));
+        nowInitialized_ = false;
     }
-    if (_isInitialized || _instance == this) {
-        esp_err_t err = esp_now_deinit();
-        if (err != ESP_OK && err != ESP_ERR_ESPNOW_NOT_INIT) ESP_LOGW(TAG, "esp_now_deinit: %s", esp_err_to_name(err));
-    }
-    _isInitialized = false;
 
-    QueueHandle_t queue = static_cast<QueueHandle_t>(_eventQueue);
-    SemaphoreHandle_t stopped = static_cast<SemaphoreHandle_t>(_workerStopped);
-    if (_workerTask && queue && stopped) {
-        Event event{};
-        event.type = EventType::STOP;
-        if (xQueueSend(queue, &event, portMAX_DELAY) == pdTRUE) {
-            xSemaphoreTake(stopped, portMAX_DELAY);
-        }
-    }
-    _workerTask = nullptr;
-    if (_eventQueue) { vQueueDelete(static_cast<QueueHandle_t>(_eventQueue)); _eventQueue = nullptr; }
-    if (_workerStopped) { vSemaphoreDelete(static_cast<SemaphoreHandle_t>(_workerStopped)); _workerStopped = nullptr; }
-    if (_instance == this) _instance = nullptr;
+    stopRequested_.store(true, std::memory_order_release);
+    initialized_ = false;
+    // Do not block on a full RX queue. Worker polls with a bounded 20 ms wait.
+    // Release API mutex while joining: an in-flight user callback may call an API method,
+    // which will now fail fast because stopping_ is set instead of deadlocking teardown.
+    lock.unlock();
+    if (workerTask_.load(std::memory_order_acquire) && workerStopped_)
+        (void)xSemaphoreTake(workerStopped_, portMAX_DELAY);
+    lock.lock();
+    workerTask_.store(nullptr, std::memory_order_release);
 
-    if (_ownsWifiStart) {
-        esp_err_t err = esp_wifi_stop();
-        if (err != ESP_OK) ESP_LOGW(TAG, "esp_wifi_stop: %s", esp_err_to_name(err));
-        _ownsWifiStart = false;
-    }
-    if (_ownsWifiInit) {
-        esp_err_t err = esp_wifi_deinit();
-        if (err != ESP_OK) ESP_LOGW(TAG, "esp_wifi_deinit: %s", esp_err_to_name(err));
-        _ownsWifiInit = false;
-    }
+    if (rxQueue_) { vQueueDelete(rxQueue_); rxQueue_ = nullptr; }
+    if (txQueue_) { vQueueDelete(txQueue_); txQueue_ = nullptr; }
+    if (workerStopped_) { vSemaphoreDelete(workerStopped_); workerStopped_ = nullptr; }
+    releaseOwnedWifi();
+    nativeVersion_ = 0;
+    effectiveMaxPayload_ = 0;
+    stopRequested_ = false;
+    stopping_ = false;
+    setError(ESP_OK);
+}
+
+void HMS_EspNow::releaseOwnedWifi() {
+    if (ownsWifiStart_) { esp_err_t e = esp_wifi_stop(); if (e != ESP_OK && e != ESP_ERR_WIFI_NOT_INIT) ESP_LOGW(TAG, "esp_wifi_stop: %s", esp_err_to_name(e)); ownsWifiStart_ = false; }
+    if (ownsWifiInit_) { esp_err_t e = esp_wifi_deinit(); if (e != ESP_OK && e != ESP_ERR_WIFI_NOT_INIT) ESP_LOGW(TAG, "esp_wifi_deinit: %s", esp_err_to_name(e)); ownsWifiInit_ = false; }
 }
 
 bool HMS_EspNow::setPrimaryMasterKey(const uint8_t* pmk) {
-    if (!_isInitialized || !pmk) return setError(ESP_ERR_INVALID_ARG);
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    if (!initialized_ || stopping_.load() || !pmk) return setError(ESP_ERR_INVALID_ARG);
     return setError(esp_now_set_pmk(pmk));
 }
 
-bool HMS_EspNow::addPeer(const uint8_t* peer_addr, bool encrypt, const uint8_t* lmk, uint8_t channel) {
-    if (!_isInitialized || !validMac(peer_addr)) return setError(ESP_ERR_INVALID_ARG);
-    if (encrypt && !lmk) return setError(ESP_ERR_INVALID_ARG);
-    if (esp_now_is_peer_exist(peer_addr)) return true;
-
+bool HMS_EspNow::addPeer(const uint8_t* mac, bool encrypt, const uint8_t* lmk, uint8_t channel) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    if (!initialized_ || stopping_.load() || !validMac(mac, true) || (encrypt && !lmk) || channel > 14) return setError(ESP_ERR_INVALID_ARG);
+    bool isBroadcast = true; for (size_t i = 0; i < 6; ++i) isBroadcast &= mac[i] == 0xFF;
+    if (isBroadcast && encrypt) return setError(ESP_ERR_INVALID_ARG);
     esp_now_peer_info_t peer{};
-    std::memcpy(peer.peer_addr, peer_addr, 6);
-    peer.channel = channel; // 0 means current channel
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = encrypt;
+    esp_err_t lookup = esp_now_get_peer(mac, &peer);
+    if (lookup == ESP_OK) {
+        if (peer.encrypt != encrypt || peer.channel != channel || peer.ifidx != config_.interface ||
+            (encrypt && std::memcmp(peer.lmk, lmk, ESP_NOW_KEY_LEN) != 0)) return setError(ESP_ERR_INVALID_STATE);
+        return setError(ESP_OK);
+    }
+    if (lookup != ESP_ERR_ESPNOW_NOT_FOUND) return setError(lookup);
+    std::memcpy(peer.peer_addr, mac, 6); peer.channel = channel; peer.ifidx = config_.interface; peer.encrypt = encrypt;
     if (encrypt) std::memcpy(peer.lmk, lmk, ESP_NOW_KEY_LEN);
     return setError(esp_now_add_peer(&peer));
 }
-
-bool HMS_EspNow::removePeer(const uint8_t* peer_addr) {
-    if (!_isInitialized || !validMac(peer_addr)) return setError(ESP_ERR_INVALID_ARG);
-    if (!esp_now_is_peer_exist(peer_addr)) return setError(ESP_ERR_ESPNOW_NOT_FOUND);
-    return setError(esp_now_del_peer(peer_addr));
+esp_err_t HMS_EspNow::addPeerDetailed(const uint8_t* mac, bool encrypt, const uint8_t* lmk, uint8_t channel) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return addPeer(mac, encrypt, lmk, channel) ? ESP_OK : lastError();
 }
 
-bool HMS_EspNow::peerExists(const uint8_t* peer_addr) const {
-    return _isInitialized && validMac(peer_addr) && esp_now_is_peer_exist(peer_addr);
+bool HMS_EspNow::removePeer(const uint8_t* mac) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    if (!initialized_ || stopping_.load() || !validMac(mac, true)) return setError(ESP_ERR_INVALID_ARG);
+    return setError(esp_now_del_peer(mac));
+}
+esp_err_t HMS_EspNow::removePeerDetailed(const uint8_t* mac) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return removePeer(mac) ? ESP_OK : lastError();
+}
+bool HMS_EspNow::peerExists(const uint8_t* mac) const {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return initialized_ && !stopping_.load() && validMac(mac, true) && esp_now_is_peer_exist(mac);
 }
 
-bool HMS_EspNow::send(const uint8_t* peer_addr, const uint8_t* data, size_t len) {
-    if (!_isInitialized || !validMac(peer_addr) || !data || len == 0 || len > HMS_ESPNOW_MAX_PAYLOAD) {
-        return setError(ESP_ERR_INVALID_ARG);
+bool HMS_EspNow::send(const uint8_t* mac, const uint8_t* data, size_t len) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    if (!initialized_ || stopping_.load() || !validMac(mac, false) || !data || len == 0 || len > configuredMaxPayload()) {
+        setError(ESP_ERR_INVALID_ARG); ++txRequestsRejected_; return false;
     }
-    if (!peerExists(peer_addr) && !addPeer(peer_addr)) return false;
-    return setError(esp_now_send(peer_addr, data, len));
+    if (!esp_now_is_peer_exist(mac)) {
+        if (config_.peer_policy != HMS_EspNowPeerPolicy::AUTO_ADD_UNENCRYPTED) {
+            setError(ESP_ERR_ESPNOW_NOT_FOUND); ++txRequestsRejected_; return false;
+        }
+        esp_now_peer_info_t peer{}; std::memcpy(peer.peer_addr, mac, 6); peer.channel = 0; peer.ifidx = config_.interface; peer.encrypt = false;
+        esp_err_t addErr = esp_now_add_peer(&peer);
+        if (addErr != ESP_OK) { setError(addErr); ++txRequestsRejected_; return false; }
+    }
+    esp_err_t err = esp_now_send(mac, data, len);
+    if (err == ESP_OK) ++txRequestsAccepted_; else ++txRequestsRejected_;
+    return setError(err);
+}
+esp_err_t HMS_EspNow::sendDetailed(const uint8_t* mac, const uint8_t* data, size_t len) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return send(mac, data, len) ? ESP_OK : lastError();
 }
 
 bool HMS_EspNow::broadcast(const uint8_t* data, size_t len) {
-    if (!_isInitialized || !data || len == 0 || len > HMS_ESPNOW_MAX_PAYLOAD) {
-        return setError(ESP_ERR_INVALID_ARG);
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    if (!initialized_ || stopping_.load() || !config_.allow_broadcast || !data || len == 0 || len > configuredMaxPayload()) {
+        setError(ESP_ERR_INVALID_ARG); ++txRequestsRejected_; return false;
     }
-    if (!peerExists(BROADCAST_MAC) && !addPeer(BROADCAST_MAC)) return false;
-    return send(BROADCAST_MAC, data, len);
+    esp_now_peer_info_t existing{};
+    esp_err_t lookup = esp_now_get_peer(BROADCAST_MAC, &existing);
+    if (lookup == ESP_OK) {
+        if (existing.encrypt || existing.ifidx != config_.interface) { setError(ESP_ERR_INVALID_STATE); ++txRequestsRejected_; return false; }
+    } else if (lookup == ESP_ERR_ESPNOW_NOT_FOUND) {
+        esp_now_peer_info_t peer{}; std::memcpy(peer.peer_addr, BROADCAST_MAC, 6); peer.channel = 0; peer.ifidx = config_.interface; peer.encrypt = false;
+        esp_err_t e = esp_now_add_peer(&peer); if (e != ESP_OK) { setError(e); ++txRequestsRejected_; return false; }
+    } else { setError(lookup); ++txRequestsRejected_; return false; }
+    esp_err_t err = esp_now_send(BROADCAST_MAC, data, len);
+    if (err == ESP_OK) ++txRequestsAccepted_; else ++txRequestsRejected_;
+    return setError(err);
+}
+esp_err_t HMS_EspNow::broadcastDetailed(const uint8_t* data, size_t len) {
+    std::lock_guard<std::recursive_mutex> lock(apiMutex_);
+    return broadcast(data, len) ? ESP_OK : lastError();
 }
 
-bool HMS_EspNow::enqueueEvent(const Event& event) {
-    if (_stopping || !_eventQueue) return false;
-    if (xQueueSend(static_cast<QueueHandle_t>(_eventQueue), &event, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "ESP-NOW event queue full; dropping event type=%u", (unsigned)event.type);
-        return false;
-    }
-    return true;
+void HMS_EspNow::enqueueRx(const RxEvent& event) {
+    if (stopping_.load(std::memory_order_acquire)) { ++rxDroppedStopping_; return; }
+    if (!rxQueue_ || xQueueSend(rxQueue_, &event, 0) != pdTRUE) { ++rxDroppedQueueFull_; return; }
+}
+void HMS_EspNow::enqueueTx(const TxEvent& event) {
+    if (stopping_.load(std::memory_order_acquire)) { ++txDroppedStopping_; return; }
+    if (!txQueue_ || xQueueSend(txQueue_, &event, 0) != pdTRUE) { ++txDroppedQueueFull_; return; }
 }
 
 void HMS_EspNow::onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-    HMS_EspNow* self = _instance;
-    if (!self || self->_stopping || !info || !info->src_addr || !data || len <= 0 ||
-        len > static_cast<int>(HMS_ESPNOW_MAX_PAYLOAD)) return;
-    Event event{};
-    event.type = EventType::RX;
-    std::memcpy(event.mac, info->src_addr, 6);
-    event.rssi = (info->rx_ctrl) ? info->rx_ctrl->rssi : 0;
-    event.len = static_cast<uint16_t>(len);
-    std::memcpy(event.data, data, static_cast<size_t>(len));
-    self->enqueueEvent(event);
+    HMS_EspNow* self = instanceSnapshot(); if (!self) return;
+    if (!self->stopping_.load(std::memory_order_acquire)) {
+        if (info && info->src_addr && data && len > 0 && static_cast<size_t>(len) <= self->configuredMaxPayload()) {
+            RxEvent event{}; std::memcpy(event.mac, info->src_addr, 6);
+            event.rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0;
+            event.len = static_cast<uint16_t>(len); std::memcpy(event.data, data, static_cast<size_t>(len));
+            ++self->rxReceived_; self->enqueueRx(event);
+        } else ++self->rxDroppedInvalid_;
+    } else ++self->rxDroppedStopping_;
+    g_callbacksInFlight.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-void HMS_EspNow::onDataSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
-    HMS_EspNow* self = _instance;
-    if (!self || self->_stopping || !info || !info->des_addr) return;
-    Event event{};
-    event.type = EventType::TX;
-    std::memcpy(event.mac, info->des_addr, 6);
-    event.success = (status == ESP_NOW_SEND_SUCCESS);
-    self->enqueueEvent(event);
+#if defined(ESP_IDF_VERSION) && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void HMS_EspNow::onDataSent(const esp_now_send_info_t* info, esp_now_send_status_t status) {
+    const uint8_t* mac = (info != nullptr) ? info->des_addr : nullptr;
+#else
+void HMS_EspNow::onDataSent(const uint8_t* mac, esp_now_send_status_t status) {
+#endif
+    HMS_EspNow* self = instanceSnapshot(); if (!self) return;
+    if (!self->stopping_.load(std::memory_order_acquire) && mac) {
+        TxEvent event{}; std::memcpy(event.mac, mac, 6); event.success = status == ESP_NOW_SEND_SUCCESS;
+        ++self->txCallbacks_;
+        if (event.success) ++self->txSuccess_; else ++self->txFailures_;
+        self->enqueueTx(event);
+    } else if (self->stopping_.load(std::memory_order_acquire)) ++self->txDroppedStopping_;
+    g_callbacksInFlight.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void HMS_EspNow::workerEntry(void* arg) {
     auto* self = static_cast<HMS_EspNow*>(arg);
+    while (self->workerTask_.load(std::memory_order_acquire) != xTaskGetCurrentTaskHandle()) vTaskDelay(1);
     self->workerLoop();
     vTaskDelete(nullptr);
 }
-
 void HMS_EspNow::workerLoop() {
-    QueueHandle_t queue = static_cast<QueueHandle_t>(_eventQueue);
     for (;;) {
-        Event event{};
-        if (xQueueReceive(queue, &event, portMAX_DELAY) != pdTRUE) continue;
-        if (event.type == EventType::STOP) break;
-        if (_stopping) continue;
-        if (event.type == EventType::RX && onReceive) {
-            onReceive(event.mac, event.data, event.len, event.rssi);
-        } else if (event.type == EventType::TX && onSend) {
-            onSend(event.mac, event.success);
+        if (stopRequested_.load(std::memory_order_acquire)) break;
+        RxEvent rx{};
+        TickType_t receiveWait = pdMS_TO_TICKS(20);
+        if (receiveWait == 0) receiveWait = 1;
+        if (rxQueue_ && xQueueReceive(rxQueue_, &rx, receiveWait) == pdTRUE) {
+            if (!stopRequested_.load() && !stopping_.load()) { dispatchReceive(rx.mac, rx.data, rx.len, rx.rssi); ++rxDelivered_; }
+        }
+        // Bound TX batch work so a continuously full TX queue cannot starve RX.
+        TxEvent tx{};
+        for (unsigned n = 0; n < 8 && txQueue_ && xQueueReceive(txQueue_, &tx, 0) == pdTRUE; ++n) {
+            if (!stopRequested_.load() && !stopping_.load()) dispatchSend(tx.mac, tx.success);
         }
     }
-    if (_workerStopped) xSemaphoreGive(static_cast<SemaphoreHandle_t>(_workerStopped));
+    if (workerStopped_) xSemaphoreGive(workerStopped_);
+}
+
+HMS_EspNowStats HMS_EspNow::stats() const {
+    HMS_EspNowStats s{};
+    s.rx_received = rxReceived_.load(); s.rx_delivered = rxDelivered_.load();
+    s.rx_dropped_queue_full = rxDroppedQueueFull_.load(); s.rx_dropped_stopping = rxDroppedStopping_.load();
+    s.rx_dropped_invalid = rxDroppedInvalid_.load(); s.tx_callbacks = txCallbacks_.load();
+    s.tx_success = txSuccess_.load(); s.tx_failures = txFailures_.load();
+    s.tx_dropped_queue_full = txDroppedQueueFull_.load(); s.tx_dropped_stopping = txDroppedStopping_.load();
+    s.tx_requests_accepted = txRequestsAccepted_.load(); s.tx_requests_rejected = txRequestsRejected_.load();
+    return s;
+}
+void HMS_EspNow::resetStats() {
+    rxReceived_ = 0; rxDelivered_ = 0; rxDroppedQueueFull_ = 0; rxDroppedStopping_ = 0; rxDroppedInvalid_ = 0;
+    txCallbacks_ = 0; txSuccess_ = 0; txFailures_ = 0; txDroppedQueueFull_ = 0; txDroppedStopping_ = 0; txRequestsAccepted_ = 0; txRequestsRejected_ = 0;
 }

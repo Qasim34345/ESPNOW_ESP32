@@ -1,35 +1,67 @@
 # Architecture
 
-## Responsibility split
+```text
+Product application
+    │
+    ├── selects role / topology / addressing
+    ├── supplies peer table and product callbacks
+    │
+    ▼
+HMS_EspNowNode (topology-aware node facade)
+    │  - validates role/topology/addressing combinations
+    │  - discovers selected local Wi-Fi MAC
+    │  - provisions configured peers and optional CCMP keys
+    │  - performs unicast fan-out or broadcast
+    │  - filters receive senders when configured
+    │
+    ├──────── optional HMS_Messaging (independent transport client)
+    │
+    ▼
+HMS_Interface (transport-neutral callback contract)
+    │
+    ▼
+HMS_EspNow (native ESP-NOW transport)
+    │  - Wi-Fi ownership/channel policy
+    │  - native version and payload capability detection
+    │  - peer table and send/receive validation
+    │  - bounded native callback queues and worker
+    │  - counters and orderly shutdown
+    ▼
+ESP-IDF esp_wifi / esp_now / FreeRTOS
+```
+
+## Layer responsibilities
 
 ### HMS_Interface
 
-- Declares `HMS_Protocol` and the transport-neutral abstract contract.
-- Exposes `begin`, `end`, unicast `send`, `broadcast`, and asynchronous receive/send callbacks.
-- Does not depend on a concrete transport, avoiding a circular component dependency.
+Defines a transport-neutral contract, including the active maximum payload capability, and dispatches callbacks outside its callback mutex. It tracks active callback invocations so owners can clear callbacks and wait for copied invocations to return. Callback payload pointers are borrowed for the callback duration.
 
 ### HMS_EspNow
 
-- Implements the abstract interface using ESP-IDF's native ESP-NOW API.
-- Initializes Wi-Fi only if it finds Wi-Fi uninitialized; records ownership so it only stops/deinitializes resources it created.
-- Adds unicast peers on demand and adds the broadcast peer when needed.
-- Validates MAC/data pointers and enforces a 250-byte payload ceiling.
-- Copies native callback data into a bounded event queue; invokes application callbacks from a worker task.
-- Provides optional encrypted-unicast peer setup via an LMK, but key provisioning remains the application's responsibility.
+Implements native ESP-NOW mechanics only. It owns Wi-Fi policy, interface/channel validation, native version query, peer registration, payload-size enforcement, callback adaptation, bounded event queues, statistics and teardown. One active instance is supported because ESP-IDF callback registration is process-global.
 
-### Example application
+### HMS_EspNowNode
 
-- Configures callbacks, starts the transport, and broadcasts a sequence-numbered heartbeat.
-- Prints incoming payload bytes safely without assuming they are null-terminated strings.
-- Is deliberately generic: no product-specific payload schema or peer MAC is embedded.
+Provides the reusable application-facing options: role, topology, addressing and payload profile. It copies peer addresses and key material during construction, discovers the selected STA/AP MAC, validates the node's mode/peer-list combination, registers unicast peers, and implements `sendToPeers()` semantics. It does not implement mesh routing or application message reliability.
 
-## Protocol selection
+The node facade uses an immutable peer table after construction. For applications requiring runtime peer-table mutation, use the lower-level `HMS_EspNow::addPeer()` / `removePeer()` API and own the associated concurrency and topology policy.
 
-The interface contract is the seam for protocol selection. The application chooses a concrete implementation (`HMS_EspNow` today). Do not add a factory inside `HMS_Interface` that directly constructs `HMS_EspNow`, because that would make the abstract component depend on the concrete component and create a dependency cycle. A future app-level factory can map a configuration enum to concrete drivers.
+### HMS_Messaging
 
-## Deliberate initial constraints
+Optional simple unicast frame/receipt-ACK layer. It has a single receive callback slot on the supplied `HMS_Interface`; do not attach it to a transport already owned by another callback-multiplexing client. ACK means well-formed frame receipt, not command execution. Blocking reliable sends are rejected from transport callbacks.
 
-- One active native ESP-NOW driver instance at a time.
-- Queue depth and worker stack are configurable.
-- The example uses fixed-channel standalone behavior only when it owns Wi-Fi startup.
-- Native send callback status is not an application delivery ACK.
+## Callback and queue flow
+
+Native callbacks validate metadata, copy data into bounded queues, update counters and return. A worker task dispatches callbacks in task context. RX and TX queues are separate; TX servicing is bounded per worker pass. RX queue depth has a direct RAM cost because each queue item reserves the compile-time maximum payload storage.
+
+## Lifecycle
+
+- Call `begin()` from task context.
+- `requestStop()` is callback-safe and asks the transport worker to exit; it does not complete resource teardown.
+- Call `end()` from a separate application task, not from a callback. It unregisters callbacks, waits for native callbacks in flight, joins the worker, releases queues and deinitializes only Wi-Fi resources owned by this component.
+- A user callback that never returns can prevent deterministic shutdown; the component cannot safely force-delete a task executing user code.
+- `HMS_EspNowNode` copies the peer table and key bytes at construction; do not mutate the caller's source buffers expecting the node to change.
+
+## TX semantics
+
+A successful `send()`/`sendToPeers()` return indicates local API acceptance. The native send callback reports MAC-layer delivery status, not remote application receipt. Use a protocol with transaction IDs and a remote application ACK when command-level confirmation is required.

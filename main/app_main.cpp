@@ -1,86 +1,112 @@
-#include <cstdio>
-#include <cstring>
-#include <memory>
-#include <new>
-#include "HMS_EspNow.h"
+#include "demo_modes.h"
+#include "peer_table.h"
+#include "HMS_EspNowNode.h"
+#include "esp_event.h"
 #include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_timer.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 namespace {
-constexpr char TAG[] = "ESPNOW_ESP32_DEMO";
-std::unique_ptr<HMS_Interface> g_transport;
-uint32_t g_sequence = 0;
+constexpr char TAG[] = "ESPNOW_EXAMPLE";
+constexpr uint32_t SEND_INTERVAL_MS = 1000;
+constexpr char MESSAGE[] = "Hello! World";
 
-// Application-level protocol selector. Add another concrete component here when
-// a future transport implements HMS_Interface; keep the interface component free
-// of dependencies on concrete transports.
-std::unique_ptr<HMS_Interface> createTransport(HMS_Protocol selected) {
-    switch (selected) {
-        case HMS_Protocol::ESPNOW:
-            return std::unique_ptr<HMS_Interface>(new (std::nothrow) HMS_EspNow());
-        case HMS_Protocol::NONE:
-        default:
-            return nullptr;
+bool initNvs() {
+    esp_err_t err=nvs_flash_init();
+    if (err==ESP_ERR_NVS_NO_FREE_PAGES || err==ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGE(TAG,"NVS recovery requires an explicit product data-migration/erase policy; refusing to erase the NVS partition");
+        return false;
     }
+    if (err!=ESP_OK) ESP_LOGE(TAG,"NVS initialization failed: %s",esp_err_to_name(err));
+    return err==ESP_OK;
 }
 
-void receiveCallback(const uint8_t* mac, const uint8_t* data, size_t len, int8_t rssi) {
-    char macText[18];
-    std::snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    // Print as bounded bytes; received data is not assumed to be a C string.
-    ESP_LOGI(TAG, "RX from %s | RSSI=%d dBm | len=%u", macText, (int)rssi, (unsigned)len);
-    ESP_LOG_BUFFER_HEXDUMP(TAG, data, len, ESP_LOG_INFO);
+bool initNetworkEvents() {
+    esp_err_t err=esp_netif_init();
+    if (err!=ESP_OK && err!=ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG,"Network interface initialization failed: %s",esp_err_to_name(err));
+        return false;
+    }
+
+    err=esp_event_loop_create_default();
+    if (err!=ESP_OK && err!=ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG,"Default event loop initialization failed: %s",esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
-void sendCallback(const uint8_t* mac, bool success) {
-    char macText[18];
-    std::snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "MAC TX result to %s: %s", macText, success ? "SUCCESS" : "FAILED");
+void onReceive(const uint8_t* mac,const uint8_t* data,size_t len,int8_t rssi) {
+    ESP_LOGI(TAG,"RX %02X:%02X:%02X:%02X:%02X:%02X RSSI=%d dBm len=%u",
+        mac[0],mac[1],mac[2],mac[3],mac[4],mac[5],(int)rssi,(unsigned)len);
+    ESP_LOG_BUFFER_HEXDUMP(TAG,data,len,ESP_LOG_INFO);
+    // This example payload is text; use bounded formatting because RX data is not NUL-terminated.
+    ESP_LOGI(TAG,"Text: %.*s",(int)len,reinterpret_cast<const char*>(data));
+}
+void onSend(const uint8_t* mac,bool success) {
+    ESP_LOGI(TAG,"MAC TX status %02X:%02X:%02X:%02X:%02X:%02X: %s",
+        mac[0],mac[1],mac[2],mac[3],mac[4],mac[5],success?"SUCCESS":"FAILED");
+    if (!success) {
+        ESP_LOGW(TAG,"No MAC-layer ACK; verify the peer is powered, configured to receive, and using the same Wi-Fi channel.");
+    }
 }
 }
 
 extern "C" void app_main(void) {
-    // This is where the application chooses its transport. Currently only
-    // ESP-NOW is implemented; HMS_Interface is ready for future transports.
-    g_transport = createTransport(HMS_Protocol::ESPNOW);
-    if (!g_transport) {
-        ESP_LOGE(TAG, "Requested transport is not available");
-        return;
-    }
+    if (!initNvs() || !initNetworkEvents()) return;
 
-    // Set callbacks before begin(), so the worker cannot race callback setup.
-    g_transport->setReceiveCallback(receiveCallback);
-    g_transport->setSendCallback(sendCallback);
+    HMS_EspNowNodeConfig cfg{};
+    cfg.role=demo_modes::ROLE;
+    cfg.topology=demo_modes::TOPOLOGY;
+    cfg.addressing=demo_modes::ADDRESSING;
+    cfg.peers=ESPNOW_EXAMPLE_PEERS;
+    cfg.peer_count=ESPNOW_EXAMPLE_PEER_COUNT;
+    cfg.filter_unicast_receivers=true;
+    cfg.transport.wifi_policy=HMS_EspNowWifiPolicy::MANAGE_IF_UNINITIALIZED;
+    cfg.transport.wifi_mode=WIFI_MODE_STA;
+    cfg.transport.interface=WIFI_IF_STA;
+    cfg.transport.channel=1; // Set the same channel on all participating nodes.
+    cfg.transport.channel_policy=HMS_EspNowChannelPolicy::REQUIRE_MATCH;
+    cfg.transport.payload_profile=HMS_EspNowPayloadProfile::V2;
+    cfg.transport.peer_policy=HMS_EspNowPeerPolicy::EXPLICIT_ONLY;
+    cfg.transport.allow_broadcast=true;
+    cfg.transport.rx_queue_depth=16;
+    cfg.transport.tx_queue_depth=24;
+    cfg.transport.worker_stack_size=6144;
 
-    if (!g_transport->begin()) {
-        ESP_LOGE(TAG, "Selected transport startup failed");
-        return;
-    }
-
-    uint8_t ownMac[6]{};
-    if (esp_wifi_get_mac(WIFI_IF_STA, ownMac) == ESP_OK) {
-        ESP_LOGI(TAG, "Station MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                 ownMac[0], ownMac[1], ownMac[2], ownMac[3], ownMac[4], ownMac[5]);
-    }
-    ESP_LOGI(TAG, "Ready. Flash this same project to two ESP32 boards on the same channel.");
-    ESP_LOGI(TAG, "Broadcast heartbeat every 5 seconds. Broadcast is not encrypted and has no application ACK.");
-
-    for (;;) {
-        char message[96];
-        const int len = std::snprintf(message, sizeof(message),
-                                      "ESPNOW_ESP32 demo seq=%lu uptime_ms=%llu",
-                                      static_cast<unsigned long>(++g_sequence),
-                                      static_cast<unsigned long long>(esp_timer_get_time() / 1000));
-        if (len > 0 && static_cast<size_t>(len) < sizeof(message)) {
-            if (!g_transport->broadcast(reinterpret_cast<const uint8_t*>(message), static_cast<size_t>(len))) {
-                ESP_LOGW(TAG, "Broadcast request rejected: %s", "see transport log");
-            }
+    static HMS_EspNowNode node(cfg);
+    node.setReceiveCallback(onReceive);
+    node.setSendCallback(onSend);
+    esp_err_t err=node.begin();
+    if (err!=ESP_OK) {
+        ESP_LOGE(TAG,"ESP-NOW node startup failed: %s",esp_err_to_name(err));
+        if (err==ESP_ERR_INVALID_ARG) {
+            ESP_LOGE(TAG,"Check main/demo_modes.h and main/peer_table.h; peer entries must be other boards, not this device.");
         }
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        return;
+    }
+
+    const auto caps=node.capabilities();
+    ESP_LOGI(TAG,"Native ESP-NOW version=%lu | effective payload=%u | peers=%u",
+        (unsigned long)caps.native_version,(unsigned)caps.effective_max_payload,(unsigned)node.peerCount());
+
+    if (node.isTransmitter()) {
+        TickType_t lastWake=xTaskGetTickCount();
+        for (;;) {
+            err=node.sendToPeers(reinterpret_cast<const uint8_t*>(MESSAGE),sizeof(MESSAGE)-1);
+            if (err!=ESP_OK) ESP_LOGW(TAG,"Send submission failed: %s",esp_err_to_name(err));
+            vTaskDelayUntil(&lastWake,pdMS_TO_TICKS(SEND_INTERVAL_MS));
+        }
+    }
+    // RX-only stays alive while the component's event worker dispatches receive callbacks.
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        const auto s=node.stats();
+        ESP_LOGI(TAG,"RX received=%lu delivered=%lu dropped(queue/invalid)=%lu/%lu | TX accepted=%lu success/fail=%lu/%lu",
+            (unsigned long)s.rx_received,(unsigned long)s.rx_delivered,
+            (unsigned long)s.rx_dropped_queue_full,(unsigned long)s.rx_dropped_invalid,
+            (unsigned long)s.tx_requests_accepted,(unsigned long)s.tx_success,(unsigned long)s.tx_failures);
     }
 }

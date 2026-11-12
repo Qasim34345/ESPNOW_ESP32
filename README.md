@@ -1,67 +1,77 @@
-# ESPNOW_ESP32 — HMS Interface + ESP-NOW example project
+# ESPNOW_Generic — reusable ESP-NOW component + example application
 
-This ESP-IDF project integrates two initially supplied components into one runnable reference application:
+This repository separates the reusable ESP-NOW implementation from the example application. The component owns transport behavior and exposes selectable communication modes; the example chooses modes, supplies its peer table, and demonstrates a periodic `Hello! World` message.
 
-- `HMS_Interface`: abstract transport contract and protocol identifier.
-- `HMS_EspNow`: ESP-NOW transport implementation of that contract.
-- `main`: two-board broadcast/receive demonstration.
+## Architecture
 
-The goal is a component-first architecture: product applications depend on the interface contract, while concrete transports implement it. ESP-NOW is the only concrete transport in this project. Future transports can implement `HMS_Interface` without changing application-level code, provided the application selects the appropriate implementation.
+- `HMS_Interface`: transport-neutral interface and callback lifetime tracking.
+- `HMS_EspNow`: ESP-IDF ESP-NOW transport, Wi-Fi policy, peer table, native capability detection, payload checks, bounded callback queues, worker task, statistics and lifecycle.
+- `HMS_EspNowNode`: topology-aware facade exposing roles, topologies, addressing modes, local MAC discovery, peer registration, topology validation, send fan-out and receive filtering.
+- `HMS_Messaging`: optional framing, sequence, receipt ACK, retry and duplicate-suppression layer for unicast application messages.
+- `main/`: editable root application, including mode and peer-table settings.
+- `components/HMS_EspNow/examples/basic_node`: standalone project that builds the same root application.
 
-## Target and toolchain
+## Project layout
 
-Designed for ESP-IDF v6.1 and the ESP32 family. The supplied native callback signatures match the ESP-IDF v6.1 API style. This archive has not been built in the actual ESP-IDF environment or verified on hardware; treat it as an implementation candidate until compiled and tested against the exact target.
+```text
+ESPNOW_Generic/
+├── CMakeLists.txt
+├── sdkconfig.defaults
+├── main/                         # Full, editable root application and board settings
+├── components/
+│   ├── HMS_Interface/
+│   ├── HMS_EspNow/
+│   │   ├── include/HMS_EspNow.h
+│   │   ├── include/HMS_EspNowNode.h
+│   │   ├── src/
+│   │   └── examples/basic_node/
+│   └── HMS_Messaging/
+└── docs/
+```
 
-## Build and flash
+## Select a communication mode
+
+Edit `main/demo_modes.h` to select:
+
+```cpp
+constexpr HMS_EspNowRole ROLE = HMS_EspNowRole::RX_ONLY;
+constexpr HMS_EspNowTopology TOPOLOGY = HMS_EspNowTopology::ONE_WAY;
+constexpr HMS_EspNowAddressing ADDRESSING = HMS_EspNowAddressing::UNICAST;
+```
+
+Edit `main/peer_table.h` for the MAC addresses of other nodes. The local interface MAC is read by the component; there is no `SELF_MAC` setting and no MAC spoofing. The radio configuration is in `main/app_main.cpp`. For the included two-board ESP32-S3 pair, the defaults target the second board (`DC:DA:0C:18:0C:10`) as `RX_ONLY`, with the first board (`DC:DA:0C:12:80:F8`) as its peer. To run the first board as TX, select `TX_ONLY` in `main/demo_modes.h` and change its peer entry to the second board's MAC.
+
+| Topology | Required roles | Behavior |
+|---|---|---|
+| `ONE_WAY` | TX_ONLY → RX_ONLY | One node sends to one receiver |
+| `TWO_WAY` | BIDIRECTIONAL on both | Two nodes send and receive |
+| `ONE_TO_MANY` | TX_ONLY → RX_ONLY nodes | Sender fans out to peers or broadcasts |
+| `MANY_TO_ONE` | TX_ONLY nodes → RX_ONLY coordinator | Senders target one coordinator by unicast, or broadcast with receiver-side sender filtering |
+| `MANY_TO_MANY` | Typically BIDIRECTIONAL on participating nodes | Nodes send to configured peers or broadcast; TX_ONLY/RX_ONLY can be used for partial participants |
+
+More detail and valid peer-table arrangements are in `components/HMS_EspNow/examples/README.md` and `docs/NETWORK_MODES.md`.
+
+## Build
 
 ```bash
-idf.py set-target esp32
+idf.py set-target esp32s3
 idf.py build
 idf.py -p COMx flash monitor
 ```
 
-Replace `esp32` with your target (for example, `esp32s3`) and `COMx` with the board's serial port. Build and flash the same project to two boards. Both boards broadcast a heartbeat every five seconds and receive packets from the other board, printing sender MAC, RSSI, length, and payload bytes.
+Use a Wi-Fi-capable target supported by the ESP-IDF version you have selected. The project intentionally does not hard-code an ESP32 target. Both ends must use a compatible Wi-Fi interface and the same RF channel.
 
-The app uses a fixed channel (channel 1) only when this driver initializes Wi-Fi itself. If Wi-Fi was already initialized by another owner, the component does not force its channel or stop that Wi-Fi subsystem. For two-board testing, ensure both devices actually operate on the same channel.
+## Protocol and production boundaries
 
-## Components
+- ESP-NOW is single-hop. Mesh routing, multi-hop forwarding, route discovery and loop prevention are not provided.
+- Broadcast cannot use per-peer CCMP encryption.
+- Native TX status is MAC-layer status, not application delivery or command execution.
+- `HMS_Messaging` receipt ACK means a valid frame was received; it does not mean the application executed the command.
+- `HMS_Messaging` wire protocol v2 requires all communicating peers to be updated together.
+- Native ESP-NOW v2 support and maximum payload depend on the exact ESP-IDF version and target. `V2` startup fails if native v2 capability is unavailable.
+- ESP-NOW peer limits vary by SDK, target and encrypted-peer configuration.
+- Production use requires secure per-device key provisioning, regulatory/channel review, target-specific memory/stack measurements, stress testing and a completed release checklist.
 
-```text
-ESPNOW_ESP32/
-├── CMakeLists.txt
-├── sdkconfig.defaults
-├── README.md
-├── components/
-│   ├── HMS_Interface/
-│   │   ├── CMakeLists.txt
-│   │   ├── include/HMS_Interface.h
-│   │   └── src/HMS_Interface.cpp
-│   └── HMS_EspNow/
-│       ├── CMakeLists.txt
-│       ├── include/HMS_EspNow.h
-│       └── src/HMS_EspNow.cpp
-├── main/
-│   ├── CMakeLists.txt
-│   └── app_main.cpp
-└── docs/
-    ├── ARCHITECTURE.md
-    ├── API_AND_LIFECYCLE.md
-    └── VALIDATION_PLAN.md
-```
+## Validation status
 
-## Important behavior and limitations
-
-- Native payload limit is conservatively set to 250 bytes for broad ESP-NOW v1.0 compatibility.
-- `send()` returning `true` means the native send request was accepted, not that the remote application processed it. The asynchronous callback reports MAC-layer send status.
-- Broadcast packets are not protected by per-peer CCMP and are not application-acknowledged.
-- Receive/send callbacks are copied into a bounded FreeRTOS queue and invoked by a worker task, not directly from the native Wi-Fi callback. Events can be dropped if the queue is full; this is logged.
-- The current implementation supports one active `HMS_EspNow` instance because native ESP-NOW callback registration is global.
-- Peer entries are transient and are cleared by ESP-NOW deinitialization.
-- Optional encrypted unicast peer configuration is exposed by `addPeer()`, but the demo does not enable it or provision keys.
-- No application-level retry/ACK, discovery/pairing, fragmentation, mesh routing, OTA, or persistent peer storage is implemented yet.
-- The component can initialize/start Wi-Fi if it finds Wi-Fi uninitialized. If Wi-Fi is already initialized, it piggybacks and leaves ownership with the existing application. Ensure that externally owned Wi-Fi is started and configured before using this component.
-- Do not call `end()` from inside a receive/send callback: it waits for the worker task to stop. Set callbacks before `begin()` and avoid changing callbacks concurrently with delivery.
-
-## Reference architecture and next steps
-
-See `docs/ARCHITECTURE.md`, `docs/API_AND_LIFECYCLE.md`, and `docs/VALIDATION_PLAN.md`. This is a starting point for development, not a production-qualified release. Compile with the exact ESP-IDF version and run the validation plan before product use.
+The workspace contains an earlier generated build for ESP-IDF v6.1-dirty / `esp32`, but that build predates the current source edits. This revision has not been built, flashed or hardware-qualified. See `docs/BUILD_STATUS.md`, `docs/COMPATIBILITY.md`, `docs/VALIDATION_PLAN.md` and `docs/RELEASE_CHECKLIST.md` before making a production claim.

@@ -1,0 +1,17 @@
+{
+    "idf.currentSetup": "D:\\esp\\.espressif\\v6.1\\esp-idf",
+    "idf.port": "COM16",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "clangd.path": "C:\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=d:\\E_Drive_Data\\AMS-IoT\\ESPNOW_Generic_Component_2_1\\ESPNOW_Generic_Production\\build"
+    ],
+    "idf.flashType": "UART"
+}
